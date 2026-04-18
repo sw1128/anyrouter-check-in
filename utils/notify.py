@@ -60,7 +60,7 @@ class NotificationKit:
 
 		data = {'title': title, 'desp': content}
 		with httpx.Client(timeout=30.0) as client:
-			client.post(f'https://sctapi.ftqq.com/{self.server_push_key}.send', json=data)
+			client.post(f'https://19351.push.ft07.com/send/{self.server_push_key}.send', json=data)
 
 	def send_dingtalk(self, title: str, content: str):
 		if not self.dingding_webhook:
