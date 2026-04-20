@@ -435,7 +435,7 @@ async def main():
 
 	if need_notify and notification_content:
 		# 构建通知标题
-		notify_title = 'AnyRouter签到成功' if success_count == total_count else 'AnyRouter签到失败'
+		notify_title = 'AnyRouter签到'
 		
 		# 合并通知内容
 		notify_content = '\n'.join(notification_content)
