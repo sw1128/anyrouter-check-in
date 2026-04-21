@@ -216,7 +216,7 @@ def format_check_in_notification(detail: dict) -> str:
 	Returns:
 		格式化后的通知消息
 	"""
-	parts = [f'💵 当前余额: ${detail["after_quota"]:.2f}']
+	parts = [f'【{detail["name"]}】', f'💵 当前余额: ${detail["after_quota"]:.2f}']
 
 	# 判断是否有变化
 	has_reward = detail['check_in_reward'] != 0
@@ -385,7 +385,7 @@ async def main():
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)
 				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
+				account_result = f'【{account_name}】 {status}'
 				if user_info_after and user_info_after.get('success'):
 					account_result += f'\n{user_info_after["display"]}'
 				elif user_info_after:
@@ -396,7 +396,7 @@ async def main():
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True  # 异常也需要通知
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			notification_content.append(f'【{account_name}】 [FAIL] exception: {str(e)[:50]}...')
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
