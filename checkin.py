@@ -416,9 +416,8 @@ async def main():
 		else:
 			print('[INFO] No balance changes detected')
 
-	# 为有余额变化的情况添加所有成功账号到通知内容
-	if balance_changed:
-		for i, account in enumerate(accounts):
+	# 将所有账号详情添加到通知内容
+	for i, account in enumerate(accounts):
 			account_key = f'account_{i + 1}'
 			if account_key in account_check_in_details:
 				detail = account_check_in_details[account_key]
@@ -435,7 +434,7 @@ async def main():
 	if current_balance_hash:
 		save_balance_hash(current_balance_hash)
 
-	if need_notify and notification_content:
+	if notification_content:
 		# 构建通知标题
 		notify_title = 'AnyRouter签到'
 		
@@ -445,9 +444,9 @@ async def main():
 		print(f'[NOTIFY] Title: {notify_title}')
 		print(notify_content)
 		notify.push_message(notify_title, notify_content, msg_type='text')
-		print('[NOTIFY] Notification sent due to failures or balance changes')
+		print('[NOTIFY] Notification sent successfully')
 	else:
-		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+		print('[WARNING] No notification content to send')
 
 	# 设置退出码
 	sys.exit(0 if success_count > 0 else 1)
