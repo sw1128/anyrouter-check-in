@@ -429,6 +429,12 @@ async def main():
 				# 检查是否已经在通知内容中（避免重复）
 				if not any(account_name in item for item in notification_content):
 					notification_content.append(account_result)
+			else:
+				# 如果没有对比详情（例如第一次查询失败），但账号执行过了，添加基础信息
+				account_name = account.get_display_name(i)
+				if not any(account_name in item for item in notification_content):
+					status = '[SUCCESS]' # 既然走到了这里且不在 notification_content 中，说明主循环没报错
+					notification_content.append(f'【{account_name}】 {status} (无变化详情)')
 
 	# 保存当前余额hash
 	if current_balance_hash:
