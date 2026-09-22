@@ -21,6 +21,11 @@ load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
 
+USER_AGENT = (
+	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+	'(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+)
+
 
 def load_balance_hash():
 	"""加载余额hash"""
@@ -76,7 +81,7 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 			context = await p.chromium.launch_persistent_context(
 				user_data_dir=temp_dir,
 				headless=False,
-				user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+				user_agent=USER_AGENT,
 				viewport={'width': 1920, 'height': 1080},
 				args=[
 					'--disable-blink-features=AutomationControlled',
@@ -207,6 +212,70 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 		return False
 
 
+def login_with_credentials(
+	client: httpx.Client, account_name: str, provider_config, username: str, password: str
+) -> dict:
+	"""使用账号密码登录，以触发该平台的「每日登录发放额度」
+
+	部分平台（如 AgentRouter）没有签到接口，签到奖励在登录动作中发放。
+	响应体的 data.checked_in 是「今日是否已签到」的状态标记——注意它无法区分
+	是本脚本还是用户浏览器登录触发的，因此只用于判断今日签到状态。
+
+	登录成功后会话 Cookie 由 httpx 自动写入 client.cookies，供后续请求复用。
+
+	Returns:
+		成功时 {'success': True, 'checked_in': bool}，失败时 {'success': False, 'error': str}
+	"""
+	print(f'[NETWORK] {account_name}: Logging in to trigger check-in')
+
+	login_url = f'{provider_config.domain}{provider_config.login_api_path}'
+	headers = {
+		'User-Agent': USER_AGENT,
+		'Content-Type': 'application/json',
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Referer': f'{provider_config.domain}{provider_config.login_path}',
+		'Origin': provider_config.domain,
+	}
+
+	try:
+		response = client.post(
+			login_url, headers=headers, json={'username': username, 'password': password}, timeout=30
+		)
+	except Exception as e:
+		return {'success': False, 'error': f'Login request failed: {str(e)[:50]}...'}
+
+	print(f'[RESPONSE] {account_name}: Login response status code {response.status_code}')
+
+	if response.status_code != 200:
+		return {'success': False, 'error': f'Login failed: HTTP {response.status_code}'}
+
+	try:
+		result = response.json()
+	except json.JSONDecodeError:
+		return {'success': False, 'error': 'Login failed: Invalid response format'}
+
+	if not result.get('success'):
+		return {'success': False, 'error': result.get('message', 'Login failed')}
+
+	data = result.get('data') or {}
+
+	# 该字段并非所有平台都有：AgentRouter 用它表示「今日已签到」，
+	# AnyRouter 的登录响应里根本没有它（其签到靠独立的 sign_in 接口），故用 None 表示未知
+	raw_checked_in = data.get('checked_in')
+	checked_in = None if raw_checked_in is None else bool(raw_checked_in)
+
+	if checked_in is True:
+		print(f'[SUCCESS] {account_name}: Logged in, today is checked in')
+	elif checked_in is False:
+		print(f'[WARNING] {account_name}: Logged in, but today is NOT checked in yet')
+	else:
+		print(f'[SUCCESS] {account_name}: Logged in')
+
+	# 登录响应里的 id 即 New-Api-User 头的取值，可用于省去手填 api_user
+	return {'success': True, 'checked_in': checked_in, 'user_id': data.get('id')}
+
+
 def format_check_in_notification(detail: dict) -> str:
 	"""格式化签到通知消息
 
@@ -218,20 +287,35 @@ def format_check_in_notification(detail: dict) -> str:
 	"""
 	parts = [f'【{detail["name"]}】', f'💵 当前余额: ${detail["after_quota"]:.2f}']
 
+	check_in_reward = detail.get('check_in_reward')
+	usage_increase = detail.get('usage_increase')
+	balance_change = detail.get('balance_change')
+
+	# 取不到签到前余额时（如仅有账号密码、无法预先查询的平台），退化为只报告签到状态
+	if check_in_reward is None or usage_increase is None or balance_change is None:
+		checked_in = detail.get('checked_in')
+		if checked_in is True:
+			parts.append('✅ 今日已签到')
+		elif checked_in is False:
+			parts.append('⚠️ 已登录但今日未签到')
+		else:
+			parts.append('ℹ️ 未取到签到前余额，无法计算收益')
+		return ' '.join(parts)
+
 	# 判断是否有变化
-	has_reward = detail['check_in_reward'] != 0
-	has_usage = detail['usage_increase'] != 0
+	has_reward = check_in_reward != 0
+	has_usage = usage_increase != 0
 
 	if has_reward:
-		parts.append(f'🎁 签到获得: +${detail["check_in_reward"]:.2f}')
+		parts.append(f'🎁 签到获得: +${check_in_reward:.2f}')
 
 	if has_usage:
-		parts.append(f'📉 期间消耗: ${detail["usage_increase"]:.2f}')
+		parts.append(f'📉 期间消耗: ${usage_increase:.2f}')
 
-	if detail['balance_change'] != 0 and not has_reward:
-		change_symbol = '+' if detail['balance_change'] > 0 else ''
-		change_emoji = '📈' if detail['balance_change'] > 0 else '📉'
-		parts.append(f'{change_emoji} 余额变化: {change_symbol}${detail["balance_change"]:.2f}')
+	if balance_change != 0 and not has_reward:
+		change_symbol = '+' if balance_change > 0 else ''
+		change_emoji = '📈' if balance_change > 0 else '📉'
+		parts.append(f'{change_emoji} 余额变化: {change_symbol}${balance_change:.2f}')
 
 	if not has_reward and not has_usage:
 		parts.append('ℹ️ 今日已签到，无变化')
@@ -252,7 +336,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	user_cookies = parse_cookies(account.cookies)
-	if not user_cookies:
+	if not user_cookies and not account.has_credentials():
 		print(f'[FAILED] {account_name}: Invalid configuration format')
 		return False, None, None
 
@@ -266,7 +350,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		client.cookies.update(all_cookies)
 
 		headers = {
-			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+			'User-Agent': USER_AGENT,
 			'Accept': 'application/json, text/plain, */*',
 			'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 			'Accept-Encoding': 'gzip, deflate, br, zstd',
@@ -280,16 +364,69 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		}
 
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-		user_info_before = get_user_info(client, headers, user_info_url)
-		if user_info_before and user_info_before.get('success'):
-			print(user_info_before['display'])
-		elif user_info_before:
-			print(user_info_before.get('error', 'Unknown error'))
+
+		# 只配了账号密码、没有 cookies 时，登录前读不到余额，跳过以免打印误导性报错
+		user_info_before = None
+		if user_cookies:
+			user_info_before = get_user_info(client, headers, user_info_url)
+			if user_info_before and user_info_before.get('success'):
+				print(user_info_before['display'])
+			elif user_info_before:
+				print(user_info_before.get('error', 'Unknown error'))
+
+		checked_in = None
+
+		# 配了账号密码就先用登录换一个新会话，顺带解决 session 频繁过期的问题
+		if provider_config.needs_login() and account.has_credentials():
+			login_result = login_with_credentials(
+				client, account_name, provider_config, account.username, account.password
+			)
+			if login_result.get('success'):
+				checked_in = login_result.get('checked_in')
+
+				# 未配置 api_user 时，用登录响应里的用户 ID 补上（该请求头必填）
+				if not account.api_user and login_result.get('user_id'):
+					headers[provider_config.api_user_key] = str(login_result['user_id'])
+					print(f'[INFO] {account_name}: Derived {provider_config.api_user_key} from login response')
+
+				# 没有独立签到接口的平台，登录动作本身就是签到（如 AgentRouter）。
+				# 签到在登录那一瞬间就完成了，因此取不到「签到前」的余额
+				if not provider_config.needs_manual_check_in():
+					user_info_after = get_user_info(client, headers, user_info_url)
+					if user_info_after and checked_in is not None:
+						user_info_after['checked_in'] = checked_in
+					return True, user_info_before, user_info_after
+
+				# 有独立签到接口的平台（如 AnyRouter）：此刻已登录、尚未签到，
+				# 若先前用旧 cookies 没取到余额，这是拿「签到前」基准值的最后机会
+				if not (user_info_before and user_info_before.get('success')):
+					user_info_before = get_user_info(client, headers, user_info_url)
+					if user_info_before and user_info_before.get('success'):
+						print(user_info_before['display'])
+
+			else:
+				print(f'[WARNING] {account_name}: Login failed - {login_result.get("error")}')
+				# 登录是唯一签到途径、或根本没有可用 cookies 时，只能判失败
+				if provider_config.needs_login_check_in() or not user_cookies:
+					print(f'[FAILED] {account_name}: Check-in requires a successful login')
+					return False, user_info_before, None
+				print(f'[INFO] {account_name}: Falling back to the configured cookies')
+
+		elif provider_config.needs_login_check_in():
+			# 只能靠登录触发签到的平台，缺账号密码就无从执行
+			print(
+				f'[FAILED] {account_name}: Provider "{account.provider}" requires '
+				'"username" and "password" in the account configuration'
+			)
+			return False, user_info_before, None
 
 		if provider_config.needs_manual_check_in():
+			# 登录后 client.cookies 已是新会话（或沿用原 cookies），在此之上调用签到接口
 			success = execute_check_in(client, account_name, provider_config, headers)
 			# 签到后再次获取用户信息，用于计算签到收益
 			user_info_after = get_user_info(client, headers, user_info_url)
+			if user_info_after and checked_in is not None:
+				user_info_after['checked_in'] = checked_in
 			return success, user_info_before, user_info_after
 		else:
 			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
@@ -348,41 +485,37 @@ async def main():
 
 			# 存储签到前后的余额信息
 			if user_info_after and user_info_after.get('success'):
-				current_quota = user_info_after['quota']
-				current_used = user_info_after['used_quota']
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
+				after_quota = user_info_after['quota']
+				after_used = user_info_after['used_quota']
+				current_balances[account_key] = {'quota': after_quota, 'used': after_used}
 
-				# 计算签到收益
+				# 计算签到收益；取不到签到前余额时（如仅有账号密码的平台）留空
 				if user_info_before and user_info_before.get('success'):
 					before_quota = user_info_before['quota']
 					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
 
-					# 计算总额度（余额 + 历史消耗）
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					# 签到获得的额度 = 总额度增加量
-					check_in_reward = total_after - total_before
-
+					# 总额度 = 余额 + 历史消耗，其增量即签到获得的额度
+					check_in_reward = (after_quota + after_used) - (before_quota + before_used)
 					# 本次消耗 = 历史消耗增加量
 					usage_increase = after_used - before_used
-
 					# 余额变化
 					balance_change = after_quota - before_quota
+				else:
+					before_quota = before_used = None
+					check_in_reward = usage_increase = balance_change = None
 
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,  # 签到获得
-						'usage_increase': usage_increase,  # 本次消耗
-						'balance_change': balance_change,  # 余额变化
-						'success': success,
-					}
+				account_check_in_details[account_key] = {
+					'name': account.get_display_name(i),
+					'before_quota': before_quota,
+					'before_used': before_used,
+					'after_quota': after_quota,
+					'after_used': after_used,
+					'check_in_reward': check_in_reward,  # 签到获得
+					'usage_increase': usage_increase,  # 本次消耗
+					'balance_change': balance_change,  # 余额变化
+					'checked_in': user_info_after.get('checked_in'),  # 登录触发签到时为 True
+					'success': success,
+				}
 
 			if should_notify_this_account:
 				account_name = account.get_display_name(i)

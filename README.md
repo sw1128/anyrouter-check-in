@@ -74,18 +74,21 @@
   {
     "name": "备用账号",
     "provider": "agentrouter",
-    "cookies": {
-      "session": "account2_session_value"
-    },
-    "api_user": "account2_api_user_id"
+    "username": "account2_username",
+    "password": "account2_password"
   }
 ]
 ```
 
 **字段说明**：
 
-- `cookies` (必需)：用于身份验证的 cookies 数据
-- `api_user` (必需)：用于请求头的 new-api-user 参数
+- `cookies` / `username` + `password` (二选一，至少填一组)：身份验证凭据
+  - `username` + `password`（**推荐**）：每次运行自动登录换取新会话，**不必再维护 cookies**。`anyrouter` 与 `agentrouter` 都支持
+    - `username` 可填**用户名或邮箱**，登录接口两者都接受
+  - `cookies`：从浏览器复制。**有效期有限、会频繁过期**，届时需重新获取
+  - 两者同时提供时：优先用账号密码登录；`cookies` 用于查询签到前余额（从而算出本次签到收益），并在登录失败时作为降级兜底
+- `api_user` (走 `cookies` 方式时必需)：用于请求头的 new-api-user 参数
+  - 走 `username` + `password` 方式时**可以省略**，脚本会自动从登录响应里的用户 ID 推断
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
 
@@ -94,6 +97,22 @@
 - 如果未提供 `provider` 字段，默认使用 `anyrouter`（向后兼容）
 - 如果未提供 `name` 字段，会使用 `Account 1`、`Account 2` 等默认名称
 - `anyrouter` 与 `agentrouter` 配置已内置，无需填写
+
+**两个平台的签到机制不同**
+
+| | anyrouter | agentrouter |
+|---|---|---|
+| 签到方式 | 独立接口 `POST /api/user/sign_in` | **登录动作本身**发放额度 |
+| 流程 | 登录换新会话 → 调签到接口 | 登录即完成签到 |
+| WAF | 全站 `acw_sc__v2` JS 挑战，需 Playwright | 仅下发 `acw_tc` 普通 cookie |
+
+AgentRouter 没有签到接口（`/api/user/sign_in`、`/api/user/check_in`、`/api/user/checkin` 等路径实测全部 404），
+每日额度在**登录动作**中发放，前端逻辑为 `data.checked_in ? "签到成功，新增额度已到账" : "登录成功！"`。
+因此只保留 session cookie 永远无法触发签到。
+
+两个平台都推荐直接填 `username` + `password`：`anyrouter` 用它换新会话以免 cookie 过期，
+`agentrouter` 用它触发签到。若账号是用 GitHub / LinuxDO 等第三方方式注册的，后端存的是随机密码，
+可在登录页点击「忘记密码？」，通过绑定邮箱重置，页面会直接给出一个新密码。
 
 接下来获取 cookies 与 api_user 的值。
 
