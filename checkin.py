@@ -148,6 +148,131 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 				return None
 
 
+IN_PAGE_FETCH_JS = """
+async ([url, method, body, apiUser, apiUserKey]) => {
+	const headers = {
+		'Content-Type': 'application/json',
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+	};
+	if (apiUser) {
+		headers[apiUserKey] = apiUser;
+	}
+	const options = { method: method, headers: headers, credentials: 'same-origin' };
+	if (body !== null) {
+		options.body = JSON.stringify(body);
+	}
+	const response = await fetch(url, options);
+	return { status: response.status, text: await response.text() };
+}
+"""
+
+
+def parse_json_response(text: str) -> dict | None:
+	"""尽力把响应文本解析成 dict，失败返回 None"""
+	try:
+		result = json.loads(text)
+	except (json.JSONDecodeError, TypeError):
+		return None
+	return result if isinstance(result, dict) else None
+
+
+async def in_page_fetch(page, url: str, method: str, body=None, api_user: str | None = None, api_user_key='new-api-user'):
+	"""在页面上下文里发起请求，走浏览器自己的网络栈"""
+	return await page.evaluate(IN_PAGE_FETCH_JS, [url, method, body, api_user, api_user_key])
+
+
+async def check_in_with_browser(
+	account_name: str, provider_config, username: str, password: str
+) -> tuple[bool, dict | None]:
+	"""登录即签到的平台：整个流程都在真实浏览器里跑
+
+	这类站点的 WAF（如 AgentRouter 的阿里云反自动化）按客户端指纹识别，
+	httpx 即便携带浏览器解开的全部 cookie 也会被判定为非浏览器并打回挑战页，
+	所以「浏览器取 cookie + httpx 发请求」这套走不通，必须把请求放进浏览器。
+
+	Returns:
+		(success, user_info) —— user_info 与 get_user_info() 的返回结构一致
+	"""
+	print(f'[PROCESSING] {account_name}: Starting browser for login-based check-in...')
+
+	login_url = f'{provider_config.domain}{provider_config.login_path}'
+	login_api = f'{provider_config.domain}{provider_config.login_api_path}'
+	user_info_api = f'{provider_config.domain}{provider_config.user_info_path}'
+
+	async with async_playwright() as p:
+		import tempfile
+
+		with tempfile.TemporaryDirectory() as temp_dir:
+			context = await p.chromium.launch_persistent_context(
+				user_data_dir=temp_dir,
+				headless=False,
+				user_agent=USER_AGENT,
+				viewport={'width': 1920, 'height': 1080},
+				args=[
+					'--disable-blink-features=AutomationControlled',
+					'--disable-dev-shm-usage',
+					'--no-sandbox',
+				],
+			)
+			try:
+				page = await context.new_page()
+
+				print(f'[PROCESSING] {account_name}: Access login page...')
+				await page.goto(login_url, wait_until='networkidle')
+
+				print(f'[NETWORK] {account_name}: Logging in to trigger check-in')
+				response = await in_page_fetch(page, login_api, 'POST', {'username': username, 'password': password})
+
+				login_result = parse_json_response(response.get('text', ''))
+				if login_result is None:
+					snippet = ' '.join(str(response.get('text', ''))[:200].split())
+					print(f'[FAILED] {account_name}: Login failed - non-JSON response: {snippet}')
+					return False, None
+
+				if not login_result.get('success'):
+					print(f'[FAILED] {account_name}: Login failed - {login_result.get("message", "unknown error")}')
+					return False, None
+
+				data = login_result.get('data') or {}
+				checked_in = bool(data.get('checked_in'))
+				# 登录响应里的 id 就是 New-Api-User 头的取值
+				api_user = str(data.get('id') or '') or None
+
+				if checked_in:
+					print(f'[SUCCESS] {account_name}: Logged in, today is checked in')
+				else:
+					print(f'[WARNING] {account_name}: Logged in, but today is NOT checked in yet')
+
+				print(f'[NETWORK] {account_name}: Fetching user info')
+				response = await in_page_fetch(
+					page, user_info_api, 'GET', None, api_user, provider_config.api_user_key
+				)
+
+				user_info_raw = parse_json_response(response.get('text', ''))
+				if not user_info_raw or not user_info_raw.get('success'):
+					print(f'[WARNING] {account_name}: Failed to fetch user info after login')
+					return True, None
+
+				user_data = user_info_raw.get('data') or {}
+				quota = round(user_data.get('quota', 0) / 500000, 2)
+				used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
+
+				return True, {
+					'success': True,
+					'quota': quota,
+					'used_quota': used_quota,
+					'checked_in': checked_in,
+					'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+				}
+
+			except Exception as e:
+				print(f'[FAILED] {account_name}: Browser check-in error - {str(e)[:80]}')
+				return False, None
+			finally:
+				await context.close()
+
+
 def get_user_info(client, headers, user_info_url: str):
 	"""获取用户信息"""
 	try:
@@ -353,6 +478,20 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
+	# 登录即签到的平台（如 AgentRouter）：其 WAF 按客户端指纹拦截非浏览器请求，
+	# 连登录本身都过不去，故整个流程都在真实浏览器里执行
+	if provider_config.needs_login_check_in():
+		if not account.has_credentials():
+			print(
+				f'[FAILED] {account_name}: Provider "{account.provider}" requires '
+				'"username" and "password" in the account configuration'
+			)
+			return False, None, None
+		success, user_info_after = await check_in_with_browser(
+			account_name, provider_config, account.username, account.password
+		)
+		return success, None, user_info_after
+
 	user_cookies = parse_cookies(account.cookies)
 	if not user_cookies and not account.has_credentials():
 		print(f'[FAILED] {account_name}: Invalid configuration format')
@@ -407,16 +546,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 					headers[provider_config.api_user_key] = str(login_result['user_id'])
 					print(f'[INFO] {account_name}: Derived {provider_config.api_user_key} from login response')
 
-				# 没有独立签到接口的平台，登录动作本身就是签到（如 AgentRouter）。
-				# 签到在登录那一瞬间就完成了，因此取不到「签到前」的余额
-				if not provider_config.needs_manual_check_in():
-					user_info_after = get_user_info(client, headers, user_info_url)
-					if user_info_after and checked_in is not None:
-						user_info_after['checked_in'] = checked_in
-					return True, user_info_before, user_info_after
-
-				# 有独立签到接口的平台（如 AnyRouter）：此刻已登录、尚未签到，
-				# 若先前用旧 cookies 没取到余额，这是拿「签到前」基准值的最后机会
+				# 此刻已登录、尚未签到，若先前用旧 cookies 没取到余额，
+				# 这是拿「签到前」基准值的最后机会
 				if not (user_info_before and user_info_before.get('success')):
 					user_info_before = get_user_info(client, headers, user_info_url)
 					if user_info_before and user_info_before.get('success'):
@@ -424,19 +555,11 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 			else:
 				print(f'[WARNING] {account_name}: Login failed - {login_result.get("error")}')
-				# 登录是唯一签到途径、或根本没有可用 cookies 时，只能判失败
-				if provider_config.needs_login_check_in() or not user_cookies:
+				# 没有 cookies 可降级时，无从签到
+				if not user_cookies:
 					print(f'[FAILED] {account_name}: Check-in requires a successful login')
 					return False, user_info_before, None
 				print(f'[INFO] {account_name}: Falling back to the configured cookies')
-
-		elif provider_config.needs_login_check_in():
-			# 只能靠登录触发签到的平台，缺账号密码就无从执行
-			print(
-				f'[FAILED] {account_name}: Provider "{account.provider}" requires '
-				'"username" and "password" in the account configuration'
-			)
-			return False, user_info_before, None
 
 		if provider_config.needs_manual_check_in():
 			# 登录后 client.cookies 已是新会话（或沿用原 cookies），在此之上调用签到接口
