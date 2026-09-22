@@ -9,6 +9,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -25,6 +26,10 @@ USER_AGENT = (
 	'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 	'(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
 )
+
+# 从浏览器里收集 WAF cookie 时要排除的登录态 cookie，
+# 避免把上一个会话的身份带进本次请求
+AUTH_COOKIE_NAMES = {'session'}
 
 
 def load_balance_hash():
@@ -106,14 +111,23 @@ async def get_waf_cookies_with_playwright(account_name: str, login_url: str, req
 
 				cookies = await page.context.cookies()
 
+				# 收集该域名下 WAF 下发的全部 cookie（登录态除外）。
+				# 不能只按固定清单取：不同出口 IP 触发的挑战不同——普通 IP 只发
+				# acw_tc，被判定为风险 IP（如 CI 机房 IP）时会追加 acw_sc__v2
+				# 这类 JS 挑战 cookie（浏览器已解开），漏掉它请求就会被打回挑战页。
+				host = urlparse(login_url).hostname or ''
 				waf_cookies = {}
 				for cookie in cookies:
 					cookie_name = cookie.get('name')
 					cookie_value = cookie.get('value')
-					if cookie_name in required_cookies and cookie_value is not None:
-						waf_cookies[cookie_name] = cookie_value
+					cookie_domain = (cookie.get('domain') or '').lstrip('.')
+					if cookie_value is None or cookie_name in AUTH_COOKIE_NAMES:
+						continue
+					if cookie_domain and not (host == cookie_domain or host.endswith(f'.{cookie_domain}')):
+						continue
+					waf_cookies[cookie_name] = cookie_value
 
-				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
+				print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies: {sorted(waf_cookies)}')
 
 				missing_cookies = [c for c in required_cookies if c not in waf_cookies]
 
@@ -253,7 +267,11 @@ def login_with_credentials(
 	try:
 		result = response.json()
 	except json.JSONDecodeError:
-		return {'success': False, 'error': 'Login failed: Invalid response format'}
+		# 把响应片段带出来，否则无法区分「被 WAF 打回挑战页」和「接口变了」
+		snippet = ' '.join(response.text[:300].split())
+		if 'arg1=' in snippet or 'acw_sc__v2' in snippet:
+			return {'success': False, 'error': 'Login blocked by WAF JS challenge (WAF cookies insufficient)'}
+		return {'success': False, 'error': f'Login failed: non-JSON response: {snippet[:120]}'}
 
 	if not result.get('success'):
 		return {'success': False, 'error': result.get('message', 'Login failed')}
