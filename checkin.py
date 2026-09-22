@@ -182,6 +182,38 @@ async def in_page_fetch(page, url: str, method: str, body=None, api_user: str | 
 	return await page.evaluate(IN_PAGE_FETCH_JS, [url, method, body, api_user, api_user_key])
 
 
+async def wait_out_waf_challenge(page, account_name: str, attempts: int = 3, wait_seconds: int = 10) -> bool:
+	"""等待 WAF 的 JS 挑战自行解开
+
+	阿里云 WAF 的挑战页特征是带 <meta name="aliyun_waf_*"> 且 <title> 为空，
+	真实页面两者都不满足。挑战脚本执行完通常会重载页面，故耐心轮询并重试。
+
+	Returns:
+		True 表示已进入真实页面
+	"""
+	probe_js = "() => !!document.querySelector('meta[name^=\"aliyun_waf_\"]')"
+
+	for attempt in range(1, attempts + 1):
+		waited = 0
+		while waited < wait_seconds:
+			try:
+				challenged = await page.evaluate(probe_js)
+			except Exception:
+				challenged = False
+			if not challenged:
+				return True
+			await page.wait_for_timeout(2000)
+			waited += 2
+
+		print(f'[WARNING] {account_name}: Still on WAF challenge page (attempt {attempt}/{attempts}), reloading...')
+		try:
+			await page.reload(wait_until='networkidle')
+		except Exception as e:
+			print(f'[WARNING] {account_name}: Reload failed - {str(e)[:60]}')
+
+	return False
+
+
 async def check_in_with_browser(
 	account_name: str, provider_config, username: str, password: str
 ) -> tuple[bool, dict | None]:
@@ -220,6 +252,11 @@ async def check_in_with_browser(
 
 				print(f'[PROCESSING] {account_name}: Access login page...')
 				await page.goto(login_url, wait_until='networkidle')
+
+				# 先确认浏览器自己有没有被 WAF 挡住，再决定要不要发登录请求
+				resolved = await wait_out_waf_challenge(page, account_name)
+				title = await page.title()
+				print(f'[INFO] {account_name}: Page title={title!r}, WAF challenge resolved={resolved}')
 
 				print(f'[NETWORK] {account_name}: Logging in to trigger check-in')
 				response = await in_page_fetch(page, login_api, 'POST', {'username': username, 'password': password})
